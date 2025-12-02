@@ -36,23 +36,21 @@ MODELS = {
 }
 
 
-def get_client():
+def get_client(api_key: str = None):
     """获取 Gemini API 客户端"""
-    global _GENAI_CLIENT
-    if _GENAI_CLIENT is None:
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            raise ValueError("请在 .env 文件中设置 GOOGLE_API_KEY")
-        _GENAI_CLIENT = genai.Client(api_key=api_key)
-    return _GENAI_CLIENT
+    # 优先使用传入的 api_key，其次使用环境变量
+    key = api_key.strip() if api_key and api_key.strip() else os.getenv("GOOGLE_API_KEY")
+    if not key:
+        raise gr.Error("请输入 API Key 或在 .env 文件中设置 GOOGLE_API_KEY")
+    return genai.Client(api_key=key)
 
 
-def generate_image(prompt: str, aspect_ratio: str, image_size: str, model_name: str):
+def generate_image(prompt: str, aspect_ratio: str, image_size: str, model_name: str, api_key: str):
     """生成图片，返回图片路径和模型回复"""
     if not prompt.strip():
         raise gr.Error("请输入图片描述")
 
-    client = get_client()
+    client = get_client(api_key)
     model_id = MODELS.get(model_name, "gemini-3-pro-image-preview")
     is_nano_banana = (model_name == "Nano Banana")
 
@@ -134,14 +132,14 @@ def generate_image(prompt: str, aspect_ratio: str, image_size: str, model_name: 
     return output_path, response_text
 
 
-def edit_image(image, edit_prompt: str, aspect_ratio: str, image_size: str, model_name: str):
+def edit_image(image, edit_prompt: str, aspect_ratio: str, image_size: str, model_name: str, api_key: str):
     """编辑图片，返回图片路径和模型回复"""
     if image is None:
         raise gr.Error("请上传图片")
     if not edit_prompt.strip():
         raise gr.Error("请输入编辑指令")
 
-    client = get_client()
+    client = get_client(api_key)
     model_id = MODELS.get(model_name, "gemini-3-pro-image-preview")
     is_nano_banana = (model_name == "Nano Banana")
 
@@ -223,8 +221,8 @@ def edit_image(image, edit_prompt: str, aspect_ratio: str, image_size: str, mode
     return output_path, response_text
 
 
-def _get_or_create_chat_session(session_id: str | None, config: types.GenerateContentConfig, model_id: str):
-    client = get_client()
+def _get_or_create_chat_session(session_id: str | None, config: types.GenerateContentConfig, model_id: str, api_key: str):
+    client = get_client(api_key)
 
     if session_id and session_id in CHAT_SESSION_STORE:
         return session_id, CHAT_SESSION_STORE[session_id]
@@ -238,7 +236,7 @@ def _get_or_create_chat_session(session_id: str | None, config: types.GenerateCo
     return new_id, new_session
 
 
-def chat_edit_image(chat_session_id, history, init_image, prompt: str, aspect_ratio: str, image_size: str, model_name: str):
+def chat_edit_image(chat_session_id, history, init_image, prompt: str, aspect_ratio: str, image_size: str, model_name: str, api_key: str):
     """多轮对话编辑图片 - 通过 session_id 引用真实 chat"""
     if not prompt.strip():
         raise gr.Error("请输入编辑指令")
@@ -258,7 +256,7 @@ def chat_edit_image(chat_session_id, history, init_image, prompt: str, aspect_ra
         image_config=types.ImageConfig(**image_config_args) if image_config_args else None
     )
 
-    session_id, chat_session = _get_or_create_chat_session(chat_session_id, base_config, model_id)
+    session_id, chat_session = _get_or_create_chat_session(chat_session_id, base_config, model_id, api_key)
 
     if history is None:
         history = []
@@ -339,7 +337,7 @@ def reset_chat(chat_session_id):
     return None, "", "", None, []
 
 
-def multi_image_generate(prompt: str, images, aspect_ratio: str, image_size: str, model_name: str):
+def multi_image_generate(prompt: str, images, aspect_ratio: str, image_size: str, model_name: str, api_key: str):
     """多图参考生成"""
     if not prompt.strip():
         raise gr.Error("请输入合成描述")
@@ -348,7 +346,7 @@ def multi_image_generate(prompt: str, images, aspect_ratio: str, image_size: str
     if len(images) > 14:
         raise gr.Error("最多支持14张参考图片")
 
-    client = get_client()
+    client = get_client(api_key)
     model_id = MODELS.get(model_name, "gemini-3-pro-image-preview")
     is_nano_banana = (model_name == "Nano Banana")
 
@@ -426,10 +424,42 @@ def multi_image_generate(prompt: str, images, aspect_ratio: str, image_size: str
     return output_path, response_text
 
 
+# 浏览器缓存 JS
+JS_LOAD_KEY = """
+function() {
+    const key = localStorage.getItem('nb_api_key') || '';
+    return key;
+}
+"""
+
+JS_SAVE_KEY = """
+function(key) {
+    if (key && key.trim()) {
+        localStorage.setItem('nb_api_key', key.trim());
+    }
+    return key;
+}
+"""
+
 # 创建界面
 with gr.Blocks(title="Nano Banana Pro") as app:
     gr.Markdown("# 🍌 Nano Banana Pro")
-    gr.Markdown("Google 最新图像生成模型 (gemini-3-pro-image-preview)")
+    gr.Markdown("Google 最新图像生成模型")
+
+    # API Key 配置
+    with gr.Accordion("API Key 配置", open=False):
+        api_key_input = gr.Textbox(
+            label="Google API Key",
+            placeholder="输入你的 API Key（会自动保存到浏览器）",
+            type="password",
+            elem_id="api_key_input"
+        )
+        gr.Markdown("*留空则使用服务器 .env 配置*")
+
+    # 页面加载时读取缓存
+    app.load(fn=None, inputs=None, outputs=api_key_input, js=JS_LOAD_KEY)
+    # 输入时保存到缓存
+    api_key_input.change(fn=None, inputs=api_key_input, outputs=api_key_input, js=JS_SAVE_KEY)
 
     with gr.Tabs():
         # 生成图片 Tab
@@ -465,7 +495,7 @@ with gr.Blocks(title="Nano Banana Pro") as app:
 
             gen_btn.click(
                 fn=generate_image,
-                inputs=[gen_prompt, gen_aspect, gen_size, gen_model],
+                inputs=[gen_prompt, gen_aspect, gen_size, gen_model, api_key_input],
                 outputs=[gen_output, gen_response]
             )
 
@@ -512,7 +542,7 @@ with gr.Blocks(title="Nano Banana Pro") as app:
 
             edit_btn.click(
                 fn=edit_image,
-                inputs=[edit_input, edit_prompt, edit_aspect, edit_size, edit_model],
+                inputs=[edit_input, edit_prompt, edit_aspect, edit_size, edit_model, api_key_input],
                 outputs=[edit_output, edit_response]
             )
 
@@ -567,7 +597,7 @@ with gr.Blocks(title="Nano Banana Pro") as app:
 
             chat_btn.click(
                 fn=chat_edit_image,
-                inputs=[chat_session_state, chat_history_state, chat_init_image, chat_prompt, chat_aspect, chat_size, chat_model],
+                inputs=[chat_session_state, chat_history_state, chat_init_image, chat_prompt, chat_aspect, chat_size, chat_model, api_key_input],
                 outputs=[chat_output, chat_response, chat_history_display, chat_session_state, chat_history_state]
             )
 
@@ -617,7 +647,7 @@ with gr.Blocks(title="Nano Banana Pro") as app:
 
             multi_btn.click(
                 fn=multi_image_generate,
-                inputs=[multi_prompt, multi_images, multi_aspect, multi_size, multi_model],
+                inputs=[multi_prompt, multi_images, multi_aspect, multi_size, multi_model, api_key_input],
                 outputs=[multi_output, multi_response]
             )
 
