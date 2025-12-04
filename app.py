@@ -221,23 +221,28 @@ def edit_image(image, edit_prompt: str, aspect_ratio: str, image_size: str, mode
     return output_path, response_text
 
 
-def _get_or_create_chat_session(session_id: str | None, config: types.GenerateContentConfig, model_id: str, api_key: str):
+def _create_chat_session(model_id: str, api_key: str):
+    """创建新的 chat session"""
     client = get_client(api_key)
-
-    if session_id and session_id in CHAT_SESSION_STORE:
-        return session_id, CHAT_SESSION_STORE[session_id]
-
+    # 创建时只设置 response_modalities
     new_session = client.chats.create(
         model=model_id,
-        config=config
+        config=types.GenerateContentConfig(
+            response_modalities=['TEXT', 'IMAGE']
+        )
     )
     new_id = str(uuid.uuid4())
-    CHAT_SESSION_STORE[new_id] = new_session
+    # 同时保存 client 和 session，防止 client 被垃圾回收
+    CHAT_SESSION_STORE[new_id] = {"client": client, "session": new_session}
     return new_id, new_session
 
 
-def chat_edit_image(chat_session_id, history, init_image, prompt: str, aspect_ratio: str, image_size: str, model_name: str, api_key: str):
-    """多轮对话编辑图片 - 通过 session_id 引用真实 chat"""
+def chat_edit_image(chat_session_id, history, init_images, prompt: str, aspect_ratio: str, image_size: str, model_name: str, api_key: str):
+    """多轮对话编辑图片 - 支持多图上传"""
+    print(f"[DEBUG] chat_edit_image called", flush=True)
+    print(f"[DEBUG] session_id={chat_session_id}, history={history}, init_images={init_images}", flush=True)
+    print(f"[DEBUG] prompt={prompt}, model_name={model_name}", flush=True)
+
     if not prompt.strip():
         raise gr.Error("请输入编辑指令")
 
@@ -251,20 +256,33 @@ def chat_edit_image(chat_session_id, history, init_image, prompt: str, aspect_ra
     if aspect_ratio != "自动":
         image_config_args["aspect_ratio"] = aspect_ratio
 
-    base_config = types.GenerateContentConfig(
-        response_modalities=['TEXT', 'IMAGE'],
+    # send_message 时的 config 需要同时包含 response_modalities 和 image_config
+    send_config = types.GenerateContentConfig(
+        response_modalities=["Text", "Image"],
         image_config=types.ImageConfig(**image_config_args) if image_config_args else None
     )
-
-    session_id, chat_session = _get_or_create_chat_session(chat_session_id, base_config, model_id, api_key)
 
     if history is None:
         history = []
 
-    existing_rounds = chat_session.get_history(curated=True)
-    if init_image and len(existing_rounds) == 0:
-        pil_image = Image.open(init_image)
-        message_content = [prompt, pil_image]
+    # 检查是否有有效的 session，没有就创建新的
+    chat_session = None
+    session_id = chat_session_id
+    if session_id and session_id in CHAT_SESSION_STORE:
+        chat_session = CHAT_SESSION_STORE[session_id]["session"]
+
+    # 如果没有 session，创建新的
+    if chat_session is None:
+        session_id, chat_session = _create_chat_session(model_id, api_key)
+
+    # 构建消息内容
+    is_first_round = len(history) == 0
+    if init_images and is_first_round:
+        # 第一轮：prompt + 所有图片
+        message_content = [prompt]
+        for img_path in init_images:
+            pil_image = Image.open(img_path)
+            message_content.append(pil_image)
     else:
         message_content = prompt
 
@@ -275,13 +293,20 @@ def chat_edit_image(chat_session_id, history, init_image, prompt: str, aspect_ra
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            print(f"[DEBUG] Attempt {attempt+1}: calling send_message...", flush=True)
+            print(f"[DEBUG] message_content type: {type(message_content)}, len: {len(message_content) if isinstance(message_content, list) else 'N/A'}", flush=True)
             response = chat_session.send_message(
                 message_content,
-                config=base_config
+                config=send_config
             )
+
+            # 调试输出
+            print(f"[DEBUG] response: {response}", flush=True)
+            print(f"[DEBUG] candidates: {response.candidates}", flush=True)
 
             if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
                 for part in response.candidates[0].content.parts:
+                    print(f"[DEBUG] part: {part}", flush=True)
                     is_thought = getattr(part, 'thought', False)
 
                     if part.text is not None:
@@ -291,9 +316,25 @@ def chat_edit_image(chat_session_id, history, init_image, prompt: str, aspect_ra
                             texts.append(part.text)
                     elif part.inline_data is not None and not is_thought:
                         image_data = part.inline_data.data
+                        print(f"[DEBUG] got image_data: {len(image_data)} bytes", flush=True)
+            else:
+                print(f"[DEBUG] No valid response parts!", flush=True)
             break
         except Exception as e:
-            if "503" in str(e) or "overloaded" in str(e).lower():
+            print(f"[DEBUG] Exception caught: {type(e).__name__}: {e}", flush=True)
+            err_msg = str(e).lower()
+            # 如果是 client closed 错误，重建 session 并重试
+            if "closed" in err_msg or "cannot send" in err_msg:
+                CHAT_SESSION_STORE.pop(session_id, None)
+                session_id, chat_session = _create_chat_session(model_id, api_key)
+                # 重新构建消息（因为是新 session，需要重新发送图片）
+                if init_images:
+                    message_content = [prompt]
+                    for img_path in init_images:
+                        pil_image = Image.open(img_path)
+                        message_content.append(pil_image)
+                continue
+            if "503" in str(e) or "overloaded" in err_msg:
                 if attempt < max_retries - 1:
                     time.sleep(3)
                     continue
@@ -557,14 +598,18 @@ with gr.Blocks(title="Nano Banana Pro") as app:
 
         # 多轮对话编辑 Tab
         with gr.TabItem("💬 多轮编辑"):
-            gr.Markdown("上传图片后可以持续对话迭代修改，每次修改基于上一次的结果")
+            gr.Markdown("上传图片后可以持续对话迭代修改，每次修改基于上一次的结果（支持多图）")
 
             chat_session_state = gr.State(value=None)  # 保存 chat session id
             chat_history_state = gr.State(value=[])  # 保存 Markdown 历史
 
             with gr.Row():
                 with gr.Column():
-                    chat_init_image = gr.Image(label="初始图片（可选）", type="filepath")
+                    chat_init_images = gr.Files(
+                        label="初始图片（可选，支持多张）",
+                        file_count="multiple",
+                        file_types=["image"]
+                    )
                     chat_prompt = gr.Textbox(
                         label="编辑指令",
                         placeholder="描述你想要的修改...",
@@ -597,7 +642,7 @@ with gr.Blocks(title="Nano Banana Pro") as app:
 
             chat_btn.click(
                 fn=chat_edit_image,
-                inputs=[chat_session_state, chat_history_state, chat_init_image, chat_prompt, chat_aspect, chat_size, chat_model, api_key_input],
+                inputs=[chat_session_state, chat_history_state, chat_init_images, chat_prompt, chat_aspect, chat_size, chat_model, api_key_input],
                 outputs=[chat_output, chat_response, chat_history_display, chat_session_state, chat_history_state]
             )
 
