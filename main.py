@@ -5,6 +5,7 @@ Google 最新的图像生成模型
 
 import os
 import base64
+import time
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -49,16 +50,43 @@ def generate_image(prompt: str, output_path: str = None) -> str:
 
     print(f"正在生成图片: {prompt[:50]}...")
 
+    transient_errors = (
+        "server disconnected without sending a response",
+        "remote protocol error",
+        "rst_stream",
+        "stream reset",
+        "connection reset",
+        "connection aborted",
+        "timeout",
+    )
+
     image_data = None
-    for chunk in client.models.generate_content_stream(
-        model="gemini-3-pro-image-preview",
-        contents=contents,
-        config=config
-    ):
-        if chunk.candidates:
-            for part in chunk.candidates[0].content.parts:
-                if hasattr(part, 'inline_data') and part.inline_data:
-                    image_data = part.inline_data.data
+    max_retries = 3
+    for attempt in range(max_retries):
+        image_data = None
+        try:
+            response = client.models.generate_content(
+                model="gemini-3-pro-image-preview",
+                contents=contents,
+                config=config
+            )
+
+            if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, 'inline_data') and part.inline_data:
+                        image_data = part.inline_data.data
+
+            if image_data:
+                break
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+        except Exception as e:
+            err_msg = str(e).lower()
+            if any(key in err_msg for key in transient_errors) and attempt < max_retries - 1:
+                time.sleep(2)
+                continue
+            raise
 
     if not image_data:
         raise Exception("未能生成图片")

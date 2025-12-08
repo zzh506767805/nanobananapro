@@ -73,6 +73,15 @@ def generate_image(prompt: str, aspect_ratio: str, image_size: str, model_name: 
         image_config=types.ImageConfig(**image_config_args) if image_config_args else None
     )
 
+    transient_errors = (
+        "server disconnected without sending a response",
+        "remote protocol error",
+        "rst_stream",
+        "stream reset",
+        "connection reset",
+        "connection aborted",
+        "timeout",
+    )
     image_data = None
     texts = []
     thoughts = []  # 思考过程
@@ -80,26 +89,35 @@ def generate_image(prompt: str, aspect_ratio: str, image_size: str, model_name: 
     # 自动重试机制（最多3次）
     max_retries = 3
     for attempt in range(max_retries):
+        image_data = None
+        texts = []
+        thoughts = []
         try:
-            for chunk in client.models.generate_content_stream(
+            response = client.models.generate_content(
                 model=model_id,
                 contents=contents,
                 config=config
-            ):
-                if chunk.candidates and chunk.candidates[0].content and chunk.candidates[0].content.parts:
-                    for part in chunk.candidates[0].content.parts:
-                        # 检查是否为思考过程
-                        is_thought = getattr(part, 'thought', False)
+            )
 
-                        if hasattr(part, 'inline_data') and part.inline_data:
-                            if not is_thought:  # 只保存最终图片
-                                image_data = part.inline_data.data
-                        if hasattr(part, 'text') and part.text:
-                            if is_thought:
-                                thoughts.append(part.text)
-                            else:
-                                texts.append(part.text)
-            break  # 成功则退出重试
+            if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+                for part in response.candidates[0].content.parts:
+                    # 检查是否为思考过程
+                    is_thought = getattr(part, 'thought', False)
+
+                    if hasattr(part, 'inline_data') and part.inline_data:
+                        if not is_thought:  # 只保存最终图片
+                            image_data = part.inline_data.data
+                    if hasattr(part, 'text') and part.text:
+                        if is_thought:
+                            thoughts.append(part.text)
+                        else:
+                            texts.append(part.text)
+
+            if image_data:
+                break  # 成功则退出重试
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
         except Exception as e:
             if "503" in str(e) or "overloaded" in str(e).lower():
                 if attempt < max_retries - 1:
@@ -107,6 +125,11 @@ def generate_image(prompt: str, aspect_ratio: str, image_size: str, model_name: 
                     texts = []  # 清空重试
                     continue
                 raise gr.Error("服务器繁忙，请稍后再试")
+            err_msg = str(e).lower()
+            if any(key in err_msg for key in transient_errors):
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
             raise gr.Error(f"API错误: {e}")
 
     if not image_data:
